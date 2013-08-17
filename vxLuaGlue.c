@@ -10,6 +10,20 @@
  * This number can be used as an int, double or pointer. See the test lua script
  * how to use it. 
  *
+ * For C++ function, the exact manging function name is required. 
+ * There is an enhancement to do symbol partial match in order to call C++
+ * manging functions if the function is static and name match is unique. 
+ * For example - a target system has following C++ functions: 
+ *   _Z10runTestAllv --> runTestAll()
+ *   _Z7runTesti     --> runTest(int)
+ *   vxDo ("runTestAll")
+ *      will be OK since the "runTestAll" is part of "_Z10runTestAllv"
+ *      and the "_Z10runTestAllv" is unique in the symbol table.
+ *   vxDo ("runTest",0)
+ *      will fail since there are many symbols in the system having "runTest" 
+ *   vxDo ("_Z7runTesti",0)
+ *      wil be Ok since the manging symbol is unique in the system
+ *
  * The advantage of this approach is that no wrapper functions need to be 
  * created for all C functions and they do not need to be registered within 
  * the lua space. This can save allot code and memory space when you have many
@@ -31,6 +45,25 @@
  *  time.h was needed to avoid some strange compiler warnings. Don't ask...
  *  Copy vxLuaGlue.c and vxLuaGlue.h to the same directory. 
  *  Add the new sources to your vxworks 'make' file and compile your project. 
+ *  
+ *  Get Lua 5.2.1 (the one I tested) from http://www.lua.org .
+ *  Copy the Source files and header files in your own vxWorks project.
+ *  I got rid of the directory structure.
+ *  Add the next line to the top of lua.h 
+ *       #include <vxWorks.h>
+ *
+ *  Add the next line to the top of ldo.c / lua.c 
+ *       #include <time.h>   
+ *  time.h was needed to avoid some strange compiler warnings. Don't ask...
+ *
+ *  Add the next line in lctype.h after #include "lua.h"
+ *       #ifdef _WRS_VXWORKS_MAJOR
+ *       #define LUA_USE_CTYPE	1
+ *       #endif
+ *  this is required to avoid compile error.
+ * 
+ *  Copy vxLuaGlue.c and vxLuaGlue.h to the same directory. 
+ *  Add the new sources to your vxworks 'make' file and compile your project. 
  *
  *  Somewhere in your application call 'TSysStartLua()'. A good place is during
  *  initialisation of your application.
@@ -48,6 +81,7 @@
  *  - Only tested on Lua 5.0.2, VxWorks 5.3 for X86 platforms 
  *    (HP-UX compile environment).
  *  - Tested on Lua 5.1.3, VxWorks 5.5.1 for MIPS
+ *  - Tested on Lua 5.2.1, VxWorks 6.1 for PPC/vxsim and VxWorks 6.8.1 for vxsim
  *
  * Technology: It uses the same technology that the target shell uses.
  *
@@ -59,10 +93,17 @@
  *
  * Modified by:
  *         Rogerz Zhang <rogerz.zhang@gmail.com>
+ *         Bin Li <bin_li71@yahoo.com>
  *
  * License: Public Domain.
  *          This means you can do whatever you want to do with it. 
  *          In return I am not responsible in any way for this source code. 
+ *
+ * Version : 1.4	26 Oct 2012		binl
+ * 			 Modified a few lines for Lua 5.2.1
+ * 			 Added symbol partial match to call C++ functions
+ *                       The symbol partial search can be disabled by removing 
+ *                         #define INCLUDE_SYM_PART_MATCH
  *
  * Version : 1.3	11 Jun 2008		rogerz
  * 			 Modified a few lines for Lua 5.1.3
@@ -85,25 +126,26 @@
 
     -- Sample Lua script
     -- print "Hello world from script.lua"
-    print "Starting tests..."
-    vxDo("LuaStringTest","Hello You!")
-    print ""
-    vxDo("LuaDecimalTest", 25)
-    print ""
-    vxDo("LuaStringDecimalTest", "This is a string.", 91)
-    print ""
-    vxDo("LuaDecimalStringTest", 65, "Another string.")
-    print ""
-    vxDo("printf", " Displaying a number from printf: %d\n", 300)
-    print ""
-    pointer = vxDo("malloc", 100)
-    vxDo("memcpy", pointer, "Just a string.", 15)
-    vxDo("printf", "Pointer test: copied string: %s", pointer)
-    vxDo("free", pointer)
-    print("The value of LuaTestVariable is "..vxGet("LuaTestVariable"))
-    vxSet("LuaTestVariable", 321)
-    print("The value of LuaTestVariable is now "..vxGet("LuaTestVariable"))
-    print"Tests ended."
+	print "Starting tests..."
+	vxDo("LuaStringTest","Hello You!")
+	print ""
+	vxDo("LuaDecimalTest", 25)
+	print ""
+	vxDo("LuaStringDecimalTest", "This is a string.", 91)
+	print ""
+	vxDo("LuaDecimalStringTest", 65, "Another string.")
+	print ""
+	vxDo("printf", "Displaying a number from printf: %d", 300)
+	print ""
+	pointer = vxDo("malloc", 100)
+	vxDo("memcpy", pointer, "Just a string.", 15)
+	vxDo("printf", "Pointer test: copied string: %s", pointer)
+	print ""
+	vxDo("free", pointer)
+	print("The value of LuaTestVariable is "..vxGet("LuaTestVariable"))
+	vxSet("LuaTestVariable", 321)
+	print("The value of LuaTestVariable is now "..vxGet("LuaTestVariable"))
+	print "Tests ended."
  *
  */
 
@@ -112,6 +154,7 @@
 #include <sysSymTbl.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <ctype.h>
 #include "a_out.h"
 
@@ -128,7 +171,79 @@
 /* To show verbose info */
 #undef VERBOSE
 
-#define LUA_5_1
+
+#if (502==LUA_VERSION_NUM)
+#define LUA_5_2
+#elif (501==LUA_VERSION_NUM)
+#define  LUA_5_1
+#else
+#endif
+
+#undef INCLUDE_SYM_PART_MATCH
+#define INCLUDE_SYM_PART_MATCH
+
+#ifdef INCLUDE_SYM_PART_MATCH
+LOCAL int      matchCnt = 0;
+LOCAL SYMBOL * matchSym  = NULL;
+
+LOCAL BOOL symSysTblFindPartMatch
+    (
+    char *	name,		/* symbol name */
+    int		val,		/* symbol value */
+    INT8	type,		/* symbol type */
+    char *	substr,		/* substring to match */
+    UINT16      group,		/* symbol's module group */
+    SYMBOL *    pSymbol		/* symbol structure */
+    )
+{
+   int         subStrLen = 0;
+   char *      symName = name;
+   int         ntries	= 0;
+
+   if ( NULL == symName || NULL == substr )
+   {
+       return FALSE;
+   }
+
+   subStrLen = strlen (substr);
+   ntries    = strlen (symName) - subStrLen;
+
+   for (; ntries >= 0; symName++, --ntries)
+   {
+       if (strncmp (symName, substr, subStrLen) == 0)
+       {
+          matchCnt++;	/* we've found a match */
+          matchSym = pSymbol; 
+          break;
+       }
+   }
+
+   return (TRUE);
+}
+
+STATUS symFindByName_4cppMangingName(SYMTAB_ID symTblId, char * name, char ** pValue, SYM_TYPE * pType)
+{
+   matchCnt = 0;
+   matchSym = NULL;
+   symEach (symTblId, (FUNCPTR) symSysTblFindPartMatch, (int) name);
+
+   if ( 1 != matchCnt)
+   {
+#ifdef VERBOSE       
+      printf("Failed - Symbol [%s]: %s\n", name, (0==matchCnt)?"not found":"not unique");
+#endif
+      return ERROR; 
+   }
+
+   if (pValue != NULL)
+        *pValue = (char *) matchSym->value;
+    
+   if (pType != NULL)
+        *pType = matchSym->type;
+
+   return OK;
+}
+#endif
 
 typedef int32_t bool_t;
 
@@ -145,7 +260,6 @@ int l_myLuaFunction(lua_State* luaVM);
 int l_ExecuteLuaCommand(lua_State* luaVM);
 int l_vxSet(lua_State* luaVM);
 int l_vxGet(lua_State* luaVM);
-int l_vxReadLine(lua_State* luaVM);
 /**
  * Function table that will be registered within Lua. 
  */
@@ -155,7 +269,6 @@ static lua_command_info lua_commands[] =
     { "vxDo",                   l_ExecuteLuaCommand     },
     { "vxSet",                  l_vxSet                 },
     { "vxGet",                  l_vxGet                 },
-    { "vxReadLine",				l_vxReadLine			},
     {0,0}
 };
 
@@ -209,7 +322,7 @@ int l_ExecuteLuaCommand(lua_State* luaVM)
 #endif
         if(lua_isnil(luaVM, i))
         {
-            arg[i-2] = NULL;
+            arg[i-2] = (int)NULL;
 #ifdef VERBOSE        
             printf("Type is NULL\n");
 #endif
@@ -301,13 +414,28 @@ int l_ExecuteLuaCommand(lua_State* luaVM)
     }
 #endif
     
-    if ( OK == symFindByName( sysSymTbl,
+    if ( OK != symFindByName( sysSymTbl,
     	      symbol_name,
     	      &symbol_value,
     	      &symbol_type ) )
     {
-        function_address = (FUNCPTR) symbol_value;
-        function_status = (*function_address)( arg[0],
+#ifdef INCLUDE_SYM_PART_MATCH
+        if ( OK != symFindByName_4cppMangingName( sysSymTbl,
+    	           symbol_name,
+    	           &symbol_value,
+    	           &symbol_type ) )
+        {
+           printf("Error: Function %s does not exist or not unique!\n", symbol_name);
+           return 0;
+        }
+#else
+        printf("Error: Function %s does not exist!\n", symbol_name);   
+        return 0;
+#endif
+    }
+
+    function_address = (FUNCPTR) symbol_value;
+    function_status = (*function_address)( arg[0],
 					   arg[1],
 					   arg[2],
 					   arg[3],
@@ -322,14 +450,9 @@ int l_ExecuteLuaCommand(lua_State* luaVM)
 					   arg[12],
 					   arg[13],
 					   arg[14] ) ;       
-	lua_pushnumber(luaVM, function_status);
-        return 1;   /* One value pushed onto the lua stack */	
-    }
-    else
-    {
-        printf("Error: Function %s does not exist!\n", symbol_name);   
-        return 0;
-    }
+    lua_pushnumber(luaVM, function_status);
+    return 1;   /* One value pushed onto the lua stack */	
+
 }
 
 
@@ -473,37 +596,6 @@ int l_vxSet(lua_State* luaVM)
     return 0;
 }
 
-int l_vxReadLine(lua_State* luaVM)
-{
-	int nArgs;
-	const char *pArg;
-	char prompt[128];
-	char buf[128];
-	int error;
-
-	nArgs = lua_gettop(luaVM);    
-    
-    /* First argument is always the function name */
-    if(nArgs>=1)
-    {
-        if(lua_isstring(luaVM, 1))
-        {
-            pArg = lua_tostring(luaVM, 1);
-            error = 0;
-        }
-    }else{
-    	error = 1;
-    }
-
-	if(!error){
-		strncpy(prompt, pArg, 128);
-		prompt[127]='\0';
-		sal_readline(prompt, buf, 128, NULL);
-		lua_pushstring(luaVM, buf);
-		return 1;
-	}
-	return 0;
-}
 
 /**
  * You can add c functions to Lua like this.
@@ -520,9 +612,12 @@ void TSysStartLua()
 {
     int i;
 
+#if defined(LUA_5_2)
+    luaVM = luaL_newstate();  /* Open Lua */
+    luaL_openlibs(luaVM);
+#elif defined(LUA_5_1)
     luaVM = lua_open();       /* Open Lua */
-#ifdef LUA_5_1
-	luaL_openlibs(luaVM);
+    luaL_openlibs(luaVM);
 #else
     luaopen_base(luaVM);     
     luaopen_table(luaVM);    
@@ -556,12 +651,19 @@ void TSysStopLua()
  */
 void TSysRunLuaScript(char * luaScriptPath)
 {
-    if(luaVM!=NULL)
-#ifdef LUA_5_1
-        luaL_dofile(luaVM, luaScriptPath);    
+    if(luaVM!=NULL) 
+    {
+#if defined(LUA_5_2)
+       printf("TSysRunLuaScript(): run %s\n", luaScriptPath);
+       if ( ! ( luaL_dofile(luaVM, luaScriptPath) ) )    
+          printf("TSysRunLuaScript(): done");
+
+#elif defined(LUA_5_1)
+       luaL_dofile(luaVM, luaScriptPath);    
 #else
-		lua_dofile(luaVM, luaScriptPath);
+       lua_dofile(luaVM, luaScriptPath);
 #endif
+    }
     else
         printf("TSysRunLuaScript(): Lua not initialized!\n");
 }
